@@ -4,67 +4,215 @@
 
 | Version | Date | Description |
 |---------|------|-------------|
-| V1.0-V2.4 | 2026-07-22~23 | From initial architecture to implementation refinement |
-| V2.5 | 2026-07-23 | **Architecture freeze**. Fixed Quota/Billing boundary, idempotent constraints, state hierarchy, concurrent updates, business invariants |
+| V1.0 | 2026-07-22 | Initial architecture design |
+| V2.0 | 2026-07-23 | Auth/Database/RBAC/Quota detailed design |
+| V2.1 | 2026-07-23 | Token security, MailDelivery state, Batch Lease, Snapshot, Health, SPF, DKIM |
+| V2.2 | 2026-07-23 | MailDeliveryAttempt, Cancel fix, Lease separation, Atomicity, PostgreSQL, GH Runner |
+| V2.3 | 2026-07-23 | DKIM remote signing API, Quota anti-double-charge, SPF Active IP Set |
+| V2.4 | 2026-07-23 | DKIM RFC 6376, permissions, Quota atomic, state machines, SPF simplification |
+| V2.5 | 2026-07-23 | **Architecture freeze**. Billing Boundary fix, idempotent constraints, state hierarchy fix, SPF atomic updates |
 
 ---
 
 ## Core Business Invariant
 
-> A MailDelivery can have multiple MailDeliveryAttempts;
-> Each actual SMTP attempt can correspond to at most one Quota CONSUME;
-> Each retry must create a new Attempt and a new QuotaTransaction;
-> The same Attempt must never be charged twice, regardless of how many times the Runner reports it.
+> A MailDelivery can have multiple MailDeliveryAttempts.
+> Each actual SMTP attempt can correspond to at most one Quota CONSUME.
+> Each retry must create a new Attempt and a new QuotaTransaction.
+> The same Attempt must never be charged twice.
 
 ---
 
-## 1. Billing Boundary Redefined (P0)
+## 1. Architecture Overview
 
-Billing Boundary = TCP connection successfully established with target SMTP server.
+```
+                         Oracle VPS (Python/FastAPI)
+                     -----------------------------
+                         Control Plane
+                              |
+        +---------------------+---------------------+
+        |                     |                     |
+        v                     v                     v
+   Auth/Users          Mail Scheduler         Runner Manager
+        |                     |                     |
+        |                     |               ------+------
+        |                     |               |           |
+        |                     |          Proxy Runner  Mail Runner
+        |                     |          (frpc/frps)   (Go Agent)
+        |                     |               |           |
+        |                     |               |      SMTP Direct
+        |                     |               |           |
+        |                     |               |           v
+        |                     |               |      Internet MX
+        |                     +--- Task/Batch/Delivery
+        +--- Quota/RBAC/Audit
+```
+
+## 2. Core Design Principles
+
+1. Oracle is Control Plane, Mail Runner is Data Plane
+2. SMTP traffic never passes through Oracle
+3. Each credential has minimum privilege, strictly isolated
+4. DKIM private key stays on Oracle, never sent to Runner
+5. Status and health_status are independent dimensions
+6. Quota uses RESERVE + CONSUME + RELEASE with atomic updates
+7. Each Task+Recipient has unique constraint to prevent duplicate delivery
+8. Each SMTP attempt has independent lifecycle record
+9. Batch uses Lease mechanism, Heartbeat is separated from Lease
+10. Development: SQLite, Production: PostgreSQL
+11. At-Least-Once Attempt Semantics, not Exactly-Once SMTP Delivery
+
+## 3. Billing Boundary Definition (P0)
+
+**Billing Boundary = TCP connection successfully established with target SMTP server.**
 
 Flow:
 1. INSERT MailDeliveryAttempt (status=CREATED)
-2. DNS lookup: fail -> FAILED, no charge
-3. TCP connect: fail -> FAILED, no charge
-4. TCP connect success:
-   a. status=STARTED
-   b. Atomic UPDATE quota_accounts SET reserved-=1, consumed+=1 WHERE reserved>=1
-   c. INSERT QuotaTransaction (CONSUME 1, attempt_id)
+2. DNS lookup fails -> FAILED, no charge
+3. TCP connect fails -> FAILED, no charge
+4. TCP connect succeeds:
+   a. status = STARTED
+   b. Atomic: UPDATE quota_accounts SET reserved-=1, consumed+=1 WHERE reserved>=1
+   c. If affected_rows == 1: INSERT QuotaTransaction (CONSUME, attempt_id)
    d. Execute SMTP (EHLO/MAIL FROM/RCPT TO/DATA)
+   e. If affected_rows == 0: QUOTA_INSUFFICIENT, abort
 
-## 2. QuotaTransaction Idempotent Constraint (P0)
+## 4. Delivery State Machine
 
-UNIQUE(attempt_id, transaction_type) prevents double charge on duplicate reports.
+### MailDelivery (Business View)
+- NOT_ATTEMPTED -> ATTEMPTING -> DELIVERED / FAILED / UNKNOWN / CANCELLED
+- FAILED reason can be: RETRY_EXHAUSTED
 
-## 3. RECOVERING State Hierarchy Fix (P0)
+### MailDeliveryAttempt (Technical View)
+- CREATED (no charge) -> STARTED (charge point) -> DELIVERED / PERMANENT_FAILURE / TEMPORARY_FAILURE / UNKNOWN
 
-RECOVERING analyzes each MailDelivery:
-- NOT_ATTEMPTED -> QUEUED
-- ATTEMPTING -> check latest Attempt:
-  - CREATED -> QUEUED
-  - STARTED -> UNKNOWN
-  - others -> no action
-- DELIVERED/FAILED -> no action
+### Retry Policy
+- TEMPORARY_FAILURE: max 3 retries at 60s/300s/900s intervals
+- Each retry = new Attempt = new CONSUME
+- After 3 failures: MailDelivery = FAILED, reason = RETRY_EXHAUSTED
+- Attempt.status stays TEMPORARY_FAILURE (matches SMTP response)
 
-## 4. MailDeliveryAttempt Unique Constraint (P0)
+## 5. Key Database Constraints (P0)
 
-UNIQUE(delivery_id, attempt_number). attempt_number generated by Oracle.
+```sql
+-- Quota: idempotent consume
+UNIQUE(attempt_id, transaction_type)
 
-## 5. RETRY_EXHAUSTED + State Layering (P1)
+-- Attempt: unique numbering
+UNIQUE(delivery_id, attempt_number)
 
-MailDelivery: DELIVERED / FAILED / UNKNOWN / CANCELLED
-MailDeliveryAttempt: CREATED / STARTED / DELIVERED / PERMANENT_FAILURE / TEMPORARY_FAILURE / UNKNOWN
+-- Task: no duplicate recipient
+UNIQUE(task_id, recipient)
+```
 
-## 6. SPF active_runner_count Atomic Update (P1)
+attempt_number MUST be generated by Oracle, never submitted by Runner.
 
-Use UPDATE ... SET count = count + 1 WHERE ip = :ip. Never read-modify-write in application layer.
+## 6. SPF Active IP Atomic Updates (P1)
 
-## 7. Architecture Freeze
+```sql
+-- Runner goes online (atomic increment)
+INSERT INTO spf_ip_records (ip, active_runner_count, created_at, updated_at)
+VALUES (:ip, 1, NOW(), NOW())
+ON CONFLICT (ip) DO UPDATE
+SET active_runner_count = spf_ip_records.active_runner_count + 1,
+    grace_period_until = NULL;
 
-V2.5 is the architecture freeze version. No more architectural changes. Proceed to implementation.
+-- Runner goes offline (atomic decrement + grace period)
+UPDATE spf_ip_records
+SET active_runner_count = active_runner_count - 1,
+    grace_period_until = CASE
+        WHEN active_runner_count - 1 <= 0 THEN NOW() + INTERVAL '30 minutes'
+        ELSE grace_period_until
+    END
+WHERE ip = :ip AND active_runner_count > 0;
+```
 
-Oracle Control Plane: User/Auth, Scheduler, Runner Manager, DKIM Signing, SPF
-Mail Runner Agent (Go): SMTP delivery, progress reporting, result reporting
+Never read-modify-write in application layer.
+
+## 7. Bounded Context Code Structure
+
+```
+/opt/proxy-manager/
+|-- main.py
+|-- proxy/       (Proxy Runner context - unchanged)
+|-- mail/        (Mail Relay context)
+|   |-- api/
+|   |-- models/
+|   |-- scheduler/
+|   |-- cloudflare/
+|   |-- signing/  (DKIM)
+|   +-- websocket/
+|-- auth/
++-- database/
+```
+
+## 8. Technology Stack
+
+| Component | Technology |
+|-----------|-----------|
+| Control Plane | Python FastAPI + SQLAlchemy |
+| Database | PostgreSQL (prod) / SQLite (dev) |
+| Session | Server-side (Database/Redis) |
+| Realtime | WebSocket |
+| SPF | Cloudflare API (atomic count) |
+| Runner trigger | GitHub API |
+| DKIM | Oracle signing API (RFC 6376) |
+| Mail Runner Agent | Go (goroutines + channels) |
+| Proxy Runner | frpc + frps + SOCKS5 (unchanged) |
+
+## 9. Runner Token Security
+
+- Bootstrap Token (TTL 5 min) -> Exchange -> Long-term Runner Token with scope
+- Scope: ["heartbeat", "claim", "progress", "result", "dkim:sign"]
+- No separate DkimSigningToken needed
+
+## 10. claim-next API
+
+```
+POST /api/mail-runners/{id}/claim-next
+
+Oracle internal atomic transaction:
+1. SELECT batch FOR UPDATE SKIP LOCKED
+2. Verify Runner health status
+3. UPDATE batch status = CLAIMED
+4. INSERT runner_batch_assignments
+5. COMMIT
+```
+
+HEALTHY: max 3 concurrent batches
+SUSPECTED: max 1 concurrent batch
+UNHEALTHY: can not claim
+
+## 11. Architecture Boundary
+
+| Function | Oracle | Runner (Go) |
+|----------|--------|-------------|
+| User management | Y | N |
+| Quota (atomic) | Y | N |
+| Task creation/split | Y | N |
+| Batch scheduling | Y | N |
+| Runner lifecycle | Y | N |
+| Health assessment | Y | N |
+| DKIM signing (RFC 6376) | Y | N |
+| SPF management (atomic) | Y | N |
+| SMTP delivery | N | Y |
+| Progress reporting | N | Y |
+| Delivery results | N | Y |
 
 ---
+
+## V2.5 Change Summary
+
+| # | Change | Priority |
+|---|--------|----------|
+| 1 | Billing Boundary = TCP connect success | P0 |
+| 2 | QuotaTransaction UNIQUE(attempt_id, type) | P0 |
+| 3 | RECOVERING state hierarchy fix | P0 |
+| 4 | MailDeliveryAttempt UNIQUE(delivery_id, attempt_number) | P0 |
+| 5 | RETRY_EXHAUSTED + Business/Technical state layering | P1 |
+| 6 | SPF active_runner_count atomic UPDATE | P1 |
+| 7 | claim-next health check + error_type enum | Doc |
+
+---
+
 *V2.5 (Architecture Freeze) - 2026-07-23*
