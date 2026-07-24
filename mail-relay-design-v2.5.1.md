@@ -739,10 +739,11 @@ TEMPORARY_FAILURE
 class QuotaAccount(Base):
     __tablename__ = "quota_accounts"
     user_id: UUID
-    quota_limit: int
-    available: int
-    reserved: int
-    consumed: int
+    quota_limit: int           # 用户额度上限（管理员可修改）
+    available: int             # 可用额度 = quota_limit - reserved - consumed
+    reserved: int              # 已预占额度（任务创建时 RESERVE）
+    consumed: int              # 已实际消耗额度（SMTP Attempt CONSUME）
+    updated_at: datetime
 ```
 
 ### QuotaTransaction（V2.3 防重复扣费，V2.5 幂等约束）
@@ -762,6 +763,26 @@ class QuotaTransaction(Base):
         UniqueConstraint(attempt_id, transaction_type,
                         name="uq_quota_attempt_type"),
     )
+
+### QuotaAdjustment（V2.5.1 新增 - 管理员额度调整审计）
+
+```python
+class QuotaAdjustment(Base):
+    __tablename__ = "quota_adjustments"
+    id: UUID
+    user_id: UUID
+    admin_id: UUID
+    old_quota_limit: int
+    new_quota_limit: int
+    delta: int                # 增加为正，减少为负
+    reason: str
+    created_at: datetime
+```
+
+**管理员只能修改 quota_limit，不得直接修改 reserved、consumed。**
+
+reserved 和 consumed 只能由任务生命周期和 Quota Transaction 自动维护。
+所有管理员额度修改必须记录 QuotaAdjustment 审计日志。
 ```
 
 ### 原子 CONSUME（V2.4 + V2.5）
@@ -790,6 +811,59 @@ WHERE user_id = :user_id
 任务完成/取消
     -> RELEASE 剩余 reserved（reserved -= N, available += N）
 ```
+
+### 管理员修改额度规则
+
+**计算关系：**
+
+```
+available = quota_limit - reserved - consumed
+```
+
+例如管理员把用户额度从 10000 修改为 20000，则 available 自动变为 20000 - reserved - consumed。
+
+**降低额度保护：**
+
+如果管理员尝试降低额度至 reserved + consumed 以下，系统必须拒绝：
+
+```
+当前：quota_limit = 10000, reserved = 3000, consumed = 5000
+管理员尝试：quota_limit = 7000
+结果：拒绝，因为 reserved + consumed = 8000 > 7000
+返回：{ "error": "quota_limit_too_low", "minimum_quota_limit": 8000 }
+```
+
+**原子操作：**
+
+```sql
+BEGIN;
+
+-- 1. 锁定管理员和目标用户行
+SELECT id FROM users WHERE id = :admin_id AND role = 'ADMIN' FOR UPDATE;
+SELECT quota_limit, reserved, consumed FROM quota_accounts
+WHERE user_id = :user_id FOR UPDATE;
+
+-- 2. 校验新额度合法性
+-- 如果 new_quota_limit < reserved + consumed -> ROLLBACK + 拒绝
+
+-- 3. 记录审计日志
+INSERT INTO quota_adjustments
+    (id, user_id, admin_id, old_quota_limit, new_quota_limit,
+     delta, reason, created_at)
+VALUES
+    (gen_random_uuid(), :user_id, :admin_id, :old_quota_limit,
+     :new_quota_limit, :delta, :reason, NOW());
+
+-- 4. 更新额度
+UPDATE quota_accounts
+SET quota_limit = :new_quota_limit,
+    updated_at = NOW()
+WHERE user_id = :user_id;
+
+COMMIT;
+```
+
+**管理员修改额度和 Runner CONSUME 使用同一套行锁机制，不会出现额度数据竞争。**
 
 ## 5.11 SenderIdentity
 
@@ -1366,10 +1440,46 @@ Runner A 突然离线
 
 ## 13.4 管理员 API
 
+### 修改用户额度
+
+```
+PATCH /admin/users/{user_id}/quota
+
+Request:
+{
+  "quota_limit": 20000,
+  "reason": "VIP 用户额度调整"
+}
+
+Response (成功):
+{
+  "user_id": "...",
+  "old_quota_limit": 10000,
+  "new_quota_limit": 20000,
+  "delta": 10000,
+  "adjustment_id": "...",
+  "available": 20000,
+  "reserved": 0,
+  "consumed": 0
+}
+
+Response (额度过低拒绝):
+{
+  "error": "quota_limit_too_low",
+  "minimum_quota_limit": 8000,
+  "reserved": 3000,
+  "consumed": 5000
+}
+```
+
+**管理员功能完整列表：**
+
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| GET  | /admin/users | 用户列表 |
-| PUT  | /admin/users/{id}/quota | 设置额度 |
+| GET  | /admin/users | 用户列表（含额度信息） |
+| GET  | /admin/users/{id}/quota | 查看用户额度详情 |
+| PATCH | /admin/users/{id}/quota | 修改用户额度 |
+| GET  | /admin/users/{id}/quota/adjustments | 查看额度调整记录 |
 | PUT  | /admin/users/{id}/status | 停用/恢复 |
 | GET  | /admin/runners | Runner 列表 |
 | POST | /admin/runners/{id}/pause | 暂停 |
@@ -1533,9 +1643,10 @@ mail:
 | 2 | 新增 PRE_ATTEMPT_FAILURE 状态 | P0 | 状态机 |
 | 3 | RECOVERING 增加 TEMPORARY_FAILURE 处理 | P1 | 状态机 |
 | 4 | Attempt Number 生成与 MailDelivery 行锁绑定 | P1 | 并发 |
-| 5 | 澄清 attempted_count 语义（recipient 数 vs Attempt 数） | P2 | 文档 |
-| 6 | 收件人标准化（Recipient Canonicalization） | P2 | 功能 |
-| 7 | DKIM 私钥生产环境加密存储（systemd LoadCredential） | P2 | 安全 |
+| 5 | 管理员额度修改功能 + QuotaAdjustment 审计模型 | P1 | 功能 |
+| 6 | 澄清 attempted_count 语义（recipient 数 vs Attempt 数） | P2 | 文档 |
+| 7 | 收件人标准化（Recipient Canonicalization） | P2 | 功能 |
+| 8 | DKIM 私钥生产环境加密存储（systemd LoadCredential） | P2 | 安全 |
 
 ---
 
@@ -1550,7 +1661,7 @@ mail:
 | V2.3 | 07-23 | 4 | DKIM 远程签名 API（方案B）、Quota 防重复扣费、SPF Active IP Set |
 | V2.4 | 07-23 | 5 | DKIM RFC 6376 规范、Runner Token Scope、Quota 原子 CONSUME、状态机完整定义、SPF 简化 |
 | V2.5 | 07-23 | 6 | Billing Boundary 修正、幂等约束、RECOVERING 层级修正、attempt_number 唯一约束、RETRY_EXHAUSTED、SPF 原子更新 |
-| V2.5.1 | 07-24 | 7 | 原子事务修正、PRE_ATTEMPT_FAILURE 状态、RECOVERING 补充、行锁绑定、attempted_count 语义、收件人标准化、DKIM 加密存储 |
+| V2.5.1 | 07-24 | 8 | 原子事务修正、PRE_ATTEMPT_FAILURE 状态、RECOVERING 补充、行锁绑定、管理员额度管理、attempted_count 语义、收件人标准化、DKIM 加密存储 |
 
 ---
 
